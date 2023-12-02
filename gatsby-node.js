@@ -1,260 +1,240 @@
-const path = require("path");
-const slug = require("slug");
-const moment = require("moment");
-const siteConfig = require("./data/SiteConfig");
+const path = require(`path`)
+const { createFilePath } = require(`gatsby-source-filesystem`)
 
-const slugify = (text) => slug(text).toLowerCase();
-
-const useSlash = (slug) => {
-  if (!slug) return "/";
-  if (slug.charAt(slug.length - 1) !== "/") return `${slug}/`;
-  return slug;
-};
-
-exports.onCreateNode = ({ node, actions, getNode }) => {
-  const { createNodeField } = actions;
-  let slug;
-  if (node.internal.type === "MarkdownRemark") {
-    const fileNode = getNode(node.parent);
-    const parsedFilePath = path.parse(fileNode.relativePath);
-    if (
-      Object.prototype.hasOwnProperty.call(node, "frontmatter") &&
-      Object.prototype.hasOwnProperty.call(node.frontmatter, "title")
-    ) {
-      slug = `/${slugify(node.frontmatter.title)}/`;
-    } else if (parsedFilePath.name !== "index" && parsedFilePath.dir !== "") {
-      slug = `/${parsedFilePath.dir}/${parsedFilePath.name}/`;
-    } else if (parsedFilePath.dir === "") {
-      slug = `/${parsedFilePath.name}/`;
-    } else {
-      slug = `/${parsedFilePath.dir}/`;
-    }
-
-    if (Object.prototype.hasOwnProperty.call(node, "frontmatter")) {
-      if (Object.prototype.hasOwnProperty.call(node.frontmatter, "slug"))
-        slug = `/${slugify(node.frontmatter.slug)}/`;
-      if (Object.prototype.hasOwnProperty.call(node.frontmatter, "date")) {
-        const date = moment(node.frontmatter.date, siteConfig.dateFromFormat);
-        if (!date.isValid)
-          console.warn(`WARNING: Invalid date.`, node.frontmatter);
-
-        createNodeField({
-          node,
-          name: "date",
-          value: date.toISOString(),
-        });
-      }
-    }
-    createNodeField({ node, name: "slug", value: useSlash(slug) });
+// creating slug field
+exports.onCreateNode = ({ node, getNode, actions }) => {
+  const { createNodeField } = actions
+  // post slug
+  if (node.internal.type === `MarkdownRemark`) {
+    const slug = createFilePath({ node, getNode })
+    createNodeField({
+      node,
+      name: `slug`,
+      value: slug,
+    })
   }
-};
+  // tag slug
+  if (node.internal.type === `TagsJson`) {
+    const slug = createFilePath({ node, getNode, basePath: `tags` })
+    createNodeField({
+      node,
+      name: `slug`,
+      value: slug,
+    })
+  }
+  // author slug
+  if (node.internal.type === `AuthorsJson`) {
+    const slug = createFilePath({ node, getNode, basePath: `authors` })
+    createNodeField({
+      node,
+      name: `slug`,
+      value: slug,
+    })
+  }
+}
+
+// schema customization
+exports.createSchemaCustomization = ({ actions, schema }) => {
+  const { createTypes } = actions
+  const typeDefs = [
+    // modifying tag in markdown frontmatter to include extra data from tag json data
+    `type MarkdownRemark implements Node {
+      frontmatter: Frontmatter
+    }`,
+    `type Frontmatter {
+      tags: [TagsJson] @link(by: "name")
+    }`,
+    `type TagsJson implements Node {
+      posts: [MarkdownRemark]! @link(by: "frontmatter.tags.name", from: "name")
+    }`,
+    // set featuredImage field to a file path / this solves error when the field value is empty string
+    `type Frontmatter {
+      featuredImage: File @fileByRelativePath
+    }`,
+    // modifying author frontmatter
+    `type Frontmatter {
+      author: AuthorsJson @link(by: "name")
+    }`,
+    `type AuthorsJson implements Node {
+      posts: [MarkdownRemark] @link(by: "frontmatter.author.name", from: "name")
+    }`,
+    `type AuthorsJson {
+      coverImage: File @fileByRelativePath
+    }`,
+    `type TagsJson {
+      coverImage: File @fileByRelativePath
+    }`,
+
+    // add a related fields for related posts
+    schema.buildObjectType({
+      name: "MarkdownRemark",
+      fields: {
+        related: {
+          type: "[MarkdownRemark]",
+          resolve: async (source, args, context, info) => {
+            const tags = source.frontmatter.tags
+            // if (!tags.length) return []
+            const { entries } = await context.nodeModel.findAll({
+              query: {
+                filter: {
+                  frontmatter: { tags: { elemMatch: { name: { in: tags } } } },
+                  id: { ne: source.id },
+                  fileAbsolutePath: { regex: "/content/posts/" },
+                },
+              },
+              type: "MarkdownRemark",
+            })
+
+            const posts = Array.from(entries)
+            return posts && posts.length ? posts : []
+          },
+        },
+      },
+    }),
+
+    // Defining SubMenu type scheme
+    schema.buildObjectType({
+      name: "SubMenu",
+      fields: {
+        name: "String!",
+        url: "String!",
+      },
+    }),
+
+    // Attaching SubMenu field to Header Menu and return empty array if null
+    schema.buildObjectType({
+      name: "SiteSiteMetadataHeaderMenu",
+      fields: {
+        subMenu: {
+          type: "[SubMenu!]",
+        },
+      },
+    }),
+  ]
+  createTypes(typeDefs)
+}
+
+// creating single pages(post/page/tag) dynamically from markdown and other data
 
 exports.createPages = async ({ graphql, actions }) => {
-  const { createPage } = actions;
-  const postPageTemplate = path.resolve("src/templates/post-template.jsx");
-  const pagePageTemplate = path.resolve("src/templates/page-template.jsx");
-  const tagPageTemplate = path.resolve("src/templates/tag-template.jsx");
-  const categoryPageTemplate = path.resolve(
-    "src/templates/category-template.jsx"
-  );
-  const blogPageTemplate = path.resolve("src/templates/blog-template.jsx");
-
-  const markdownQueryResult = await graphql(
-    `
-      {
-        allMarkdownRemark(sort: { fields: [frontmatter___date], order: DESC }) {
-          edges {
-            node {
-              fields {
-                slug
-              }
-              frontmatter {
-                template
-                title
-                tags
-                categories
-                date
-              }
+  const { createPage } = actions
+  const result = await graphql(`
+    query {
+      posts: allMarkdownRemark(
+        filter: {
+          frontmatter: { published: { ne: false } }
+          fileAbsolutePath: { regex: "/content/posts/" }
+        }
+        sort: { fields: frontmatter___date, order: DESC }
+      ) {
+        edges {
+          node {
+            fields {
+              slug
             }
           }
         }
       }
-    `
-  );
+      pages: allMarkdownRemark(
+        filter: {
+          frontmatter: { published: { ne: false } }
+          fileAbsolutePath: { regex: "/content/pages/" }
+        }
+      ) {
+        edges {
+          node {
+            fields {
+              slug
+            }
+          }
+        }
+      }
+      tags: allTagsJson {
+        edges {
+          node {
+            fields {
+              slug
+            }
+          }
+        }
+      }
+      authors: allAuthorsJson {
+        edges {
+          node {
+            fields {
+              slug
+            }
+          }
+        }
+      }
+    }
+  `)
 
-  if (markdownQueryResult.errors) {
-    console.error(markdownQueryResult.errors);
-    throw markdownQueryResult.errors;
+  // Handle errors
+  if (result.errors) {
+    reporter.panicOnBuild(`Error while running GraphQL query.`)
+    return
   }
 
-  // Filter data
-  const tagSet = new Set();
-  const categorySet = new Set();
-  const postEdges = [];
-  const pageEdges = [];
+  const postTemplate = path.resolve(`./src/templates/post.js`)
+  const pageTemplate = path.resolve(`./src/templates/page.js`)
+  const tagTemplate = path.resolve(`./src/templates/tag.js`)
+  const authorTemplate = path.resolve(`./src/templates/author.js`)
 
-  markdownQueryResult.data.allMarkdownRemark.edges.forEach((edge) => {
-    if (edge.node.frontmatter.tags) {
-      edge.node.frontmatter.tags.forEach((tag) => {
-        tagSet.add(tag);
-      });
-    }
-
-    if (edge.node.frontmatter.categories) {
-      edge.node.frontmatter.categories.forEach((category) => {
-        categorySet.add(category);
-      });
-    }
-
-    if (edge.node.frontmatter.template === "post") {
-      postEdges.push(edge);
-    }
-
-    if (edge.node.frontmatter.template === "page") {
-      pageEdges.push(edge);
-    }
-  });
-
-  // Create tagList, categoryList
-  const tagList = Array.from(tagSet);
-  const categoryList = Array.from(categorySet);
-
-  // Get latest posts
-  const latestPostEdges = [];
-  postEdges.forEach((edge) => {
-    if (latestPostEdges.length < siteConfig.numberLatestPost) {
-      latestPostEdges.push(edge);
-    }
-  });
-
-  // Create post page
-  postEdges.forEach((edge, index) => {
-    const nextID = index + 1 < postEdges.length ? index + 1 : 0;
-    const prevID = index - 1 >= 0 ? index - 1 : postEdges.length - 1;
-    const nextEdge = postEdges[nextID];
-    const prevEdge = postEdges[prevID];
-
+  // extract post data from query
+  const posts = result.data.posts.edges
+  // create post pages
+  posts.forEach(({ node }, index) => {
+    const slug = node.fields.slug
     createPage({
-      path: useSlash(edge.node.fields.slug),
-      component: postPageTemplate,
+      path: slug,
+      component: postTemplate,
       context: {
-        slug: edge.node.fields.slug,
-        nexttitle: nextEdge.node.frontmatter.title,
-        nextslug: nextEdge.node.fields.slug,
-        prevtitle: prevEdge.node.frontmatter.title,
-        prevslug: prevEdge.node.fields.slug,
-        tagList,
-        categoryList,
-        latestPostEdges,
+        slug: slug,
+        next: index === 0 ? null : posts[index - 1].node.fields.slug,
+        prev:
+          index === posts.length - 1 ? null : posts[index + 1].node.fields.slug,
       },
-    });
-  });
+    })
+  })
 
-  // create page page
-  pageEdges.forEach((edge) => {
+  // extract post data from query
+  const pages = result.data.pages.edges
+  // create pages from markdown files located in "content/pages" folder
+  pages.forEach(({ node }) => {
+    const slug = node.fields.slug
     createPage({
-      path: useSlash(edge.node.fields.slug),
-      component: pagePageTemplate,
+      path: slug,
+      component: pageTemplate,
       context: {
-        slug: edge.node.fields.slug,
-        tagList,
-        categoryList,
-        latestPostEdges,
+        slug: slug,
       },
-    });
-  });
+    })
+  })
 
-  // common config for pagination
-  const postsPerPage = siteConfig.postsPerPage;
-  const pathPrefixPagination = siteConfig.pathPrefixPagination;
+  // Extract tag data from query
+  const tags = result.data.tags.edges
+  // create tag pages
+  tags.forEach(({ node }) => {
+    createPage({
+      path: `/tag${node.fields.slug}`,
+      component: tagTemplate,
+      context: {
+        slug: node.fields.slug,
+      },
+    })
+  })
 
-  // create tag page
-  tagList.forEach((tag) => {
-    const tagPosts = postEdges.filter((edge) => {
-      const tags = edge.node.frontmatter.tags;
-      return tags && tags.includes(tag);
-    });
-
-    const numTagPages = Math.ceil(tagPosts.length / postsPerPage);
-    const basePath = `${siteConfig.pathPrefixTag}/${slugify(tag)}`;
-
-    for (let i = 0; i < numTagPages; i++) {
-      createPage({
-        path: useSlash(
-          i === 0
-            ? `${basePath}`
-            : `${basePath}${pathPrefixPagination}/${i + 1}`
-        ),
-        component: tagPageTemplate,
-        context: {
-          tag,
-          tagList,
-          categoryList,
-          latestPostEdges,
-          limit: postsPerPage,
-          skip: i * postsPerPage,
-          currentPage: i + 1,
-          totalPages: numTagPages,
-        },
-      });
-    }
-  });
-
-  // create category page
-  categoryList.forEach((category) => {
-    const categoryPosts = postEdges.filter((edge) => {
-      const categories = edge.node.frontmatter.categories;
-      return categories && categories.includes(category);
-    });
-
-    const numCategoryPages = Math.ceil(categoryPosts.length / postsPerPage);
-    const basePath = `${siteConfig.pathPrefixCategory}/${slugify(category)}`;
-
-    for (let i = 0; i < numCategoryPages; i++) {
-      createPage({
-        path: useSlash(
-          i === 0
-            ? `${basePath}`
-            : `${basePath}${pathPrefixPagination}/${i + 1}`
-        ),
-        component: categoryPageTemplate,
-        context: {
-          category,
-          tagList,
-          categoryList,
-          latestPostEdges,
-          limit: postsPerPage,
-          skip: i * postsPerPage,
-          currentPage: i + 1,
-          totalPages: numCategoryPages,
-        },
-      });
-    }
-  });
-
-  // Create blog page
-  {
-    const numBlogPages = Math.ceil(postEdges.length / postsPerPage);
-    const basePath = siteConfig.pathPrefixBlog;
-
-    for (let i = 0; i < numBlogPages; i++) {
-      createPage({
-        path: useSlash(
-          i === 0
-            ? `${basePath}`
-            : `${basePath}${pathPrefixPagination}/${i + 1}`
-        ),
-        component: blogPageTemplate,
-        context: {
-          tagList,
-          categoryList,
-          latestPostEdges,
-          limit: postsPerPage,
-          skip: i * postsPerPage,
-          currentPage: i + 1,
-          totalPages: numBlogPages,
-        },
-      });
-    }
-  }
-};
+  // Extract author data from query
+  const authors = result.data.authors.edges
+  // create author pages
+  authors.forEach(({ node }) => {
+    createPage({
+      path: `/author${node.fields.slug}`,
+      component: authorTemplate,
+      context: {
+        slug: node.fields.slug,
+      },
+    })
+  })
+}
